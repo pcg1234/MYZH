@@ -1,32 +1,65 @@
-FROM python:3.8-slim
+FROM python:3.13-alpine AS builder
 
-ARG APP_WORKDIR=/tv
+ARG NGINX_VER=1.27.4
+ARG RTMP_VER=1.2.2
+
+WORKDIR /app
+
+COPY Pipfile* ./
+
+RUN apk update && apk add --no-cache gcc musl-dev python3-dev libffi-dev zlib-dev jpeg-dev wget make pcre-dev openssl-dev \
+  && pip install pipenv \
+  && PIPENV_VENV_IN_PROJECT=1 pipenv install --deploy
+
+RUN wget https://nginx.org/download/nginx-${NGINX_VER}.tar.gz && \
+    tar xzf nginx-${NGINX_VER}.tar.gz
+
+RUN wget https://github.com/arut/nginx-rtmp-module/archive/v${RTMP_VER}.tar.gz && \
+    tar xzf v${RTMP_VER}.tar.gz
+
+WORKDIR /app/nginx-${NGINX_VER}
+RUN ./configure \
+    --add-module=/app/nginx-rtmp-module-${RTMP_VER} \
+    --conf-path=/etc/nginx/nginx.conf \
+    --error-log-path=/var/log/nginx/error.log \
+    --http-log-path=/var/log/nginx/access.log \
+    --with-http_ssl_module && \
+    make && \
+    make install
+
+FROM python:3.13-alpine
+
+ARG APP_WORKDIR=/iptv-api
 
 ENV APP_WORKDIR=$APP_WORKDIR
-
-COPY . $APP_WORKDIR
+ENV APP_PORT=8000
+ENV PATH="/.venv/bin:/usr/local/nginx/sbin:$PATH"
 
 WORKDIR $APP_WORKDIR
 
-RUN pip install -i https://mirrors.aliyun.com/pypi/simple pipenv
+COPY . $APP_WORKDIR
 
-RUN pipenv install
+COPY --from=builder /app/.venv /.venv
+COPY --from=builder /usr/local/nginx /usr/local/nginx
 
-RUN sed -i "s@deb.debian.org@mirrors.aliyun.com@g" /etc/apt/sources.list \
-  && sed -i "s@security.debian.org@mirrors.aliyun.com@g" /etc/apt/sources.list
+RUN mkdir -p /var/log/nginx && \
+  ln -sf /dev/stdout /var/log/nginx/access.log && \
+  ln -sf /dev/stderr /var/log/nginx/error.log
 
-RUN apt-get update && apt-get install -y cron
+RUN apk update && apk add --no-cache ffmpeg pcre
 
-ARG INSTALL_CHROMIUM=false
+EXPOSE $APP_PORT 8080 1935
 
-RUN if [ "$INSTALL_CHROMIUM" = "true" ]; then apt-get install -y chromium chromium-driver cron; fi
+COPY entrypoint.sh /iptv-api-entrypoint.sh
 
-RUN (crontab -l ; echo "0 22 * * * cd $APP_WORKDIR && /usr/local/bin/pipenv run python main.py scheduled_task 2>&1 | tee -a /var/log/tv.log"; echo "0 10 * * * cd $APP_WORKDIR && /usr/local/bin/pipenv run python main.py scheduled_task 2>&1 | tee -a /var/log/tv.log") | crontab -
+COPY config /iptv-api-config
 
-EXPOSE 8000
+COPY nginx.conf /etc/nginx/nginx.conf
 
-COPY entrypoint.sh /tv_entrypoint.sh
+RUN mkdir -p /usr/local/nginx/html
 
-RUN chmod +x /tv_entrypoint.sh
+COPY stat.xsl /usr/local/nginx/html/stat.xsl
 
-ENTRYPOINT /tv_entrypoint.sh
+RUN chmod +x /iptv-api-entrypoint.sh
+
+ENTRYPOINT /iptv-api-entrypoint.sh
